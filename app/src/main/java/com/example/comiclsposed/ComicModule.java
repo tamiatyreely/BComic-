@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.CookieManager;
 import android.webkit.WebView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -26,7 +27,18 @@ public class ComicModule extends XposedModule {
     private static final String TAG = "ComicModule";
     private static final int MAX_CHARS = 80000;
 
+    private static final String PROBE_JS =
+            "(function(){try{"
+            + "var r=performance.getEntriesByType('resource').filter(function(e){"
+            + "return e.initiatorType==='xmlhttprequest'||e.initiatorType==='fetch';})"
+            + ".map(function(e){return e.name.split('#')[0];});"
+            + "return JSON.stringify({title:document.title,ua:navigator.userAgent,"
+            + "text:((document.body&&document.body.innerText)||'').substring(0,500),"
+            + "api:r.slice(0,40)});"
+            + "}catch(e){return 'err '+e;}})()";
+
     private final Set<String> dumped = new HashSet<>();
+    private final Set<String> probed = new HashSet<>();
     private final StringBuilder record = new StringBuilder();
 
     @Override
@@ -37,7 +49,7 @@ public class ComicModule extends XposedModule {
     private static String scrub(String s) {
         if (s == null) return "null";
         return s.replaceAll(
-                "(?i)(access_key|accesskey|token|sessdata|cookie|sign|csrf|sid)=([^&\\s,;]*)",
+                "(?i)(access_key|accesskey|token|sessdata|cookie|sign|csrf|sid)=([^&\\s,;\"]*)",
                 "$1=<hidden>");
     }
 
@@ -69,6 +81,7 @@ public class ComicModule extends XposedModule {
         if (it == null) return "(no intent)";
         StringBuilder sb = new StringBuilder(it.toString());
         try {
+            sb.append("\n    data = ").append(it.getDataString());
             Bundle b = it.getExtras();
             if (b != null) {
                 for (String k : b.keySet()) {
@@ -89,9 +102,52 @@ public class ComicModule extends XposedModule {
         return sb.toString();
     }
 
+    private String cookieNames(String url) {
+        try {
+            String c = CookieManager.getInstance().getCookie(url);
+            if (c == null) return "(无)";
+            StringBuilder sb = new StringBuilder();
+            for (String part : c.split(";")) {
+                int i = part.indexOf('=');
+                sb.append(i > 0 ? part.substring(0, i).trim() : part.trim()).append(' ');
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "error";
+        }
+    }
+
+    private void probeWebView(Object self, Object urlObj) {
+        try {
+            if (!(self instanceof WebView) || !(urlObj instanceof String)) return;
+            String url = (String) urlObj;
+            if (!url.contains("manga.bilibili.com/blackboard")) return;
+            final WebView wv = (WebView) self;
+            String key = System.identityHashCode(wv) + url;
+            if (!probed.add(key)) return;
+            long[] delays = {5000, 12000};
+            for (long d : delays) {
+                wv.postDelayed(() -> {
+                    try {
+                        wv.evaluateJavascript(PROBE_JS, value -> {
+                            String v = value == null ? "null" : value;
+                            if (v.length() > 3000) v = v.substring(0, 3000);
+                            note("【网页探测】" + v);
+                            note("【Cookie名】" + cookieNames("https://manga.bilibili.com"));
+                            copyRecord(wv.getContext());
+                            toast(wv.getContext(), "网页探测完成,已复制");
+                        });
+                    } catch (Throwable ignored) {
+                    }
+                }, d);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        // 页面创建:提示 + 记录名字和启动参数
+        // 页面创建
         try {
             Method onCreate = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
             hook(onCreate).intercept(chain -> {
@@ -112,7 +168,7 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook onCreate 失败", t);
         }
 
-        // 页面跳转:记录是谁启动了哪个页面、带了什么参数
+        // 页面跳转
         try {
             Method start = Activity.class.getDeclaredMethod(
                     "startActivityForResult", Intent.class, int.class, Bundle.class);
@@ -132,12 +188,13 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook startActivityForResult 失败", t);
         }
 
-        // 网页加载:记录加载了什么网址
+        // 网页加载
         try {
             Method load1 = WebView.class.getDeclaredMethod("loadUrl", String.class);
             hook(load1).intercept(chain -> {
                 try {
                     note("【网页】loadUrl " + chain.getArg(0));
+                    probeWebView(chain.getThisObject(), chain.getArg(0));
                 } catch (Throwable ignored) {
                 }
                 return chain.proceed();
@@ -146,6 +203,7 @@ public class ComicModule extends XposedModule {
             hook(load2).intercept(chain -> {
                 try {
                     note("【网页】loadUrl " + chain.getArg(0));
+                    probeWebView(chain.getThisObject(), chain.getArg(0));
                 } catch (Throwable ignored) {
                 }
                 return chain.proceed();
@@ -174,7 +232,7 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook Dialog 失败", t);
         }
 
-        // 页面显示后记录控件树并复制到剪贴板(开屏页会多记几次)
+        // 页面显示后记录控件树
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
