@@ -5,15 +5,18 @@ import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.lang.reflect.Method;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 import io.github.libxposed.api.XposedModule;
@@ -31,7 +34,15 @@ public class ComicModule extends XposedModule {
         log(Log.INFO, TAG, "模块已加载,进程: " + param.getProcessName());
     }
 
+    private static String scrub(String s) {
+        if (s == null) return "null";
+        return s.replaceAll(
+                "(?i)(access_key|accesskey|token|sessdata|cookie|sign|csrf|sid)=([^&\\s,;]*)",
+                "$1=<hidden>");
+    }
+
     private synchronized void note(String msg) {
+        msg = scrub(msg);
         log(Log.INFO, TAG, msg);
         record.append(msg).append('\n');
         if (record.length() > MAX_CHARS) {
@@ -54,9 +65,33 @@ public class ComicModule extends XposedModule {
         }
     }
 
+    private String describe(Intent it) {
+        if (it == null) return "(no intent)";
+        StringBuilder sb = new StringBuilder(it.toString());
+        try {
+            Bundle b = it.getExtras();
+            if (b != null) {
+                for (String k : b.keySet()) {
+                    String lk = k.toLowerCase();
+                    String s;
+                    if (lk.contains("token") || lk.contains("key")
+                            || lk.contains("cookie") || lk.contains("auth")) {
+                        s = "<hidden>";
+                    } else {
+                        s = String.valueOf(b.get(k));
+                        if (s.length() > 300) s = s.substring(0, 300) + "...";
+                    }
+                    sb.append("\n    extra ").append(k).append(" = ").append(s);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return sb.toString();
+    }
+
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        // 页面创建:弹提示 + 记录名字
+        // 页面创建:提示 + 记录名字和启动参数
         try {
             Method onCreate = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
             hook(onCreate).intercept(chain -> {
@@ -66,7 +101,7 @@ public class ComicModule extends XposedModule {
                     if (self instanceof Activity) {
                         Activity act = (Activity) self;
                         String name = act.getClass().getName();
-                        note("【页面】" + name);
+                        note("【页面】" + name + "\n  intent: " + describe(act.getIntent()));
                         toast(act, "【页面】" + name);
                     }
                 } catch (Throwable ignored) {
@@ -77,7 +112,49 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook onCreate 失败", t);
         }
 
-        // 弹窗显示:弹提示 + 记录名字
+        // 页面跳转:记录是谁启动了哪个页面、带了什么参数
+        try {
+            Method start = Activity.class.getDeclaredMethod(
+                    "startActivityForResult", Intent.class, int.class, Bundle.class);
+            hook(start).intercept(chain -> {
+                try {
+                    Object self = chain.getThisObject();
+                    Object a0 = chain.getArg(0);
+                    if (a0 instanceof Intent) {
+                        note("【跳转】从 " + (self == null ? "?" : self.getClass().getName())
+                                + " 启动: " + describe((Intent) a0));
+                    }
+                } catch (Throwable ignored) {
+                }
+                return chain.proceed();
+            });
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hook startActivityForResult 失败", t);
+        }
+
+        // 网页加载:记录加载了什么网址
+        try {
+            Method load1 = WebView.class.getDeclaredMethod("loadUrl", String.class);
+            hook(load1).intercept(chain -> {
+                try {
+                    note("【网页】loadUrl " + chain.getArg(0));
+                } catch (Throwable ignored) {
+                }
+                return chain.proceed();
+            });
+            Method load2 = WebView.class.getDeclaredMethod("loadUrl", String.class, Map.class);
+            hook(load2).intercept(chain -> {
+                try {
+                    note("【网页】loadUrl " + chain.getArg(0));
+                } catch (Throwable ignored) {
+                }
+                return chain.proceed();
+            });
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hook WebView 失败", t);
+        }
+
+        // 弹窗
         try {
             Method show = Dialog.class.getDeclaredMethod("show");
             hook(show).intercept(chain -> {
@@ -97,7 +174,7 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook Dialog 失败", t);
         }
 
-        // 页面显示 2 秒后,记录控件树并复制到剪贴板
+        // 页面显示后记录控件树并复制到剪贴板(开屏页会多记几次)
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
@@ -106,12 +183,19 @@ public class ComicModule extends XposedModule {
                     Object self = chain.getThisObject();
                     if (self instanceof Activity) {
                         final Activity act = (Activity) self;
-                        if (dumped.add(act.getClass().getName())) {
-                            act.getWindow().getDecorView().postDelayed(() -> {
-                                dumpTree(act);
-                                copyRecord(act);
-                                toast(act, "记录已复制到剪贴板");
-                            }, 2000);
+                        final String name = act.getClass().getName();
+                        final boolean splash = name.toLowerCase().contains("splash");
+                        if (splash || dumped.add(name)) {
+                            final View decor = act.getWindow().getDecorView();
+                            long[] delays = splash ? new long[]{200, 800, 2000} : new long[]{2000};
+                            for (long d : delays) {
+                                final boolean last = (d == delays[delays.length - 1]);
+                                decor.postDelayed(() -> {
+                                    dumpTree(act, splash);
+                                    copyRecord(act);
+                                    if (last) toast(act, "记录已复制到剪贴板");
+                                }, d);
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
@@ -123,18 +207,18 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    private void dumpTree(Activity act) {
+    private void dumpTree(Activity act, boolean all) {
         try {
             StringBuilder sb = new StringBuilder();
-            walk(act.getWindow().getDecorView(), 0, sb, new int[]{0});
+            walk(act.getWindow().getDecorView(), 0, sb, new int[]{0}, all);
             note("【控件树】" + act.getClass().getName() + "\n" + sb);
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "dumpTree 失败", t);
         }
     }
 
-    private void walk(View v, int depth, StringBuilder sb, int[] count) {
-        if (count[0] > 300 || depth > 30) return;
+    private void walk(View v, int depth, StringBuilder sb, int[] count, boolean all) {
+        if (count[0] > 250 || depth > 30) return;
         String idName = "";
         try {
             if (v.getId() != View.NO_ID) {
@@ -147,19 +231,20 @@ public class ComicModule extends XposedModule {
             CharSequence cs = ((TextView) v).getText();
             text = cs == null ? "" : cs.toString();
         }
-        if (!idName.isEmpty() || !text.isEmpty()) {
+        if (all || !idName.isEmpty() || !text.isEmpty()) {
             count[0]++;
             for (int i = 0; i < depth; i++) sb.append(' ');
-            sb.append(v.getClass().getSimpleName())
+            sb.append(v.getClass().getName())
               .append(" id=").append(idName)
               .append(" text=").append(text)
-              .append(" vis=").append(v.getVisibility())
-              .append('\n');
+              .append(" vis=").append(v.getVisibility());
+            if (all) sb.append(" size=").append(v.getWidth()).append('x').append(v.getHeight());
+            sb.append('\n');
         }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
-                walk(g.getChildAt(i), depth + 1, sb, count);
+                walk(g.getChildAt(i), depth + 1, sb, count, all);
             }
         }
     }
