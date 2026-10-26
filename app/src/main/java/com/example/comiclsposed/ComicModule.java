@@ -7,6 +7,7 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,8 +21,11 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
@@ -37,14 +41,23 @@ public class ComicModule extends XposedModule {
 
     // ===== 开关 =====
     private static final boolean AUTO_CHECKIN = true;      // 自动签到
-    private static final boolean DEBUG_TOAST = false;      // 每个页面/弹窗都弹提示(调试用)
-    private static final boolean DEBUG_CLIPBOARD = true;   // 把记录复制到剪贴板(抓开屏/弹窗时用,抓完改成 false)
+    private static final boolean SKIP_SPLASH = true;       // 实验性:开屏页停下来时直接跳过
+    private static final boolean DEBUG_TOAST = false;      // 每个页面/弹窗都弹提示
+    private static final boolean DEBUG_CLIPBOARD = true;   // 把记录复制到剪贴板(抓完改成 false)
+    private static final boolean LISTEN_FLUTTER = true;    // 记录 Flutter 消息(找弹窗线索)
 
     private static final String PREF = "comic_mod";
     private static final String HIDDEN_TAG = "cm_hidden";
+    private static final String SPLASH_ACTIVITY = "com.bilibili.comic.splash.view.activity.SplashActivity";
     private static final String MAIN_ACTIVITY = "com.bilibili.comic.home.view.FlutterMainActivity";
     private static final String MARKETING_URL =
             "https://manga.bilibili.com/blackboard/YihuDyrSvatVqMVn.html";
+
+    private static final Set<String> NOISY = new HashSet<>(Arrays.asList(
+            "flutter/lifecycle", "flutter/mousecursor", "flutter/textinput",
+            "flutter/keyevent", "flutter/accessibility", "flutter/platform_views",
+            "flutter/restoration", "flutter/navigation", "flutter/settings",
+            "flutter/system", "flutter/keyboard"));
 
     private static final String CHECK_JS =
             "(function(){try{var e=performance.getEntriesByType('resource'),s=[];"
@@ -53,8 +66,13 @@ public class ComicModule extends XposedModule {
             + "return 'n='+e.length+';clock='+s.join(',');}catch(x){return 'err='+x;}})()";
 
     private final Set<String> dumped = new HashSet<>();
+    private final Set<Integer> skipped = new HashSet<>();
     private final StringBuilder record = new StringBuilder();
+    private final StringBuilder flutterRec = new StringBuilder();
+    private final Map<String, Integer> channelCount = new HashMap<>();
+    private final long t0 = System.currentTimeMillis();
     private boolean autoStarted = false;
+    private volatile boolean splashStartedMain = false;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -83,6 +101,16 @@ public class ComicModule extends XposedModule {
         }
     }
 
+    private void flutterNote(String line) {
+        line = scrub(line);
+        synchronized (flutterRec) {
+            flutterRec.append(line).append('\n');
+            if (flutterRec.length() > 60000) {
+                flutterRec.delete(0, flutterRec.length() - 60000);
+            }
+        }
+    }
+
     private void toast(Context ctx, String msg) {
         try {
             Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show();
@@ -94,7 +122,13 @@ public class ComicModule extends XposedModule {
         if (!DEBUG_CLIPBOARD) return;
         try {
             ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
-            cm.setPrimaryClip(ClipData.newPlainText("ComicModule", record.toString()));
+            String text = record.toString();
+            synchronized (flutterRec) {
+                if (flutterRec.length() > 0) {
+                    text += "\n==== Flutter 消息 ====\n" + flutterRec;
+                }
+            }
+            cm.setPrimaryClip(ClipData.newPlainText("ComicModule", text));
         } catch (Throwable ignored) {
         }
     }
@@ -122,6 +156,29 @@ public class ComicModule extends XposedModule {
         } catch (Throwable ignored) {
         }
         return sb.toString();
+    }
+
+    // ---------- 跳过开屏 ----------
+
+    private void skipSplash(Activity act) {
+        try {
+            if (act.isFinishing() || act.isDestroyed()) return;
+            Intent it = new Intent();
+            it.setClassName(act.getPackageName(), MAIN_ACTIVITY);
+            it.setData(Uri.parse("bilicomic://main/mainpage"));
+            it.putExtra("flutter.page", "/flutter/app_entry");
+            Bundle params = new Bundle();
+            params.putString("target", "");
+            params.putString("page", "");
+            params.putString("origin_page", "");
+            it.putExtra("flutter.params", params);
+            it.putExtra("blrouter.props", new Bundle());
+            act.startActivity(it);
+            act.finish();
+            note("【开屏】开屏页停留,已直接跳转主页");
+        } catch (Throwable t) {
+            note("【开屏】跳过失败: " + t);
+        }
     }
 
     // ---------- 自动签到 ----------
@@ -213,10 +270,70 @@ public class ComicModule extends XposedModule {
         }
     }
 
+    // ---------- Flutter 消息监听 ----------
+
+    private void hookFlutter(ClassLoader cl) {
+        try {
+            Class<?> jni = Class.forName("io.flutter.embedding.engine.FlutterJNI", false, cl);
+            int n = 0;
+            for (Method m : jni.getDeclaredMethods()) {
+                if (!m.getName().equals("handlePlatformMessage")) continue;
+                hook(m).intercept(chain -> {
+                    try {
+                        logChannel(chain.getArg(0), chain.getArg(1));
+                    } catch (Throwable ignored) {
+                    }
+                    return chain.proceed();
+                });
+                n++;
+            }
+            note("【Flutter】已监听 handlePlatformMessage x" + n);
+        } catch (Throwable t) {
+            note("【Flutter】监听失败: " + t);
+        }
+    }
+
+    private void logChannel(Object chObj, Object msgObj) {
+        String ch = String.valueOf(chObj);
+        if (NOISY.contains(ch)) return;
+        int c;
+        synchronized (channelCount) {
+            Integer v = channelCount.get(ch);
+            c = v == null ? 1 : v + 1;
+            channelCount.put(ch, c);
+        }
+        if (c > 300) return;
+        String body = "";
+        if (msgObj instanceof ByteBuffer) {
+            ByteBuffer dup = ((ByteBuffer) msgObj).duplicate();
+            int n = Math.min(dup.remaining(), 500);
+            byte[] b = new byte[n];
+            dup.get(b);
+            StringBuilder sb = new StringBuilder();
+            boolean lastDot = false;
+            for (byte x : b) {
+                if (x >= 32 && x < 127) {
+                    sb.append((char) x);
+                    lastDot = false;
+                } else if (!lastDot) {
+                    sb.append('·');
+                    lastDot = true;
+                }
+            }
+            body = sb.toString().replaceAll("[A-Za-z0-9_\\-]{24,}", "<long>");
+        }
+        flutterNote(String.format(Locale.US, "[%.1fs] %s #%d %s",
+                (System.currentTimeMillis() - t0) / 1000.0, ch, c, body));
+    }
+
     // ---------- hook ----------
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
+        if (LISTEN_FLUTTER) {
+            hookFlutter(param.getClassLoader());
+        }
+
         // 页面创建
         try {
             Method onCreate = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
@@ -227,6 +344,7 @@ public class ComicModule extends XposedModule {
                     if (self instanceof Activity) {
                         Activity act = (Activity) self;
                         String name = act.getClass().getName();
+                        if (SPLASH_ACTIVITY.equals(name)) splashStartedMain = false;
                         note("【页面】" + name + "\n  intent: " + describe(act.getIntent()));
                         if (DEBUG_TOAST) toast(act, "【页面】" + name);
                     }
@@ -247,8 +365,9 @@ public class ComicModule extends XposedModule {
                     Object self = chain.getThisObject();
                     Object a0 = chain.getArg(0);
                     if (a0 instanceof Intent) {
-                        note("【跳转】从 " + (self == null ? "?" : self.getClass().getName())
-                                + " 启动: " + describe((Intent) a0));
+                        String from = self == null ? "?" : self.getClass().getName();
+                        if (SPLASH_ACTIVITY.equals(from)) splashStartedMain = true;
+                        note("【跳转】从 " + from + " 启动: " + describe((Intent) a0));
                     }
                 } catch (Throwable ignored) {
                 }
@@ -258,7 +377,7 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook startActivityForResult 失败", t);
         }
 
-        // 网页加载:记录网址;用户手动打开营销中心时,保存网页环境(初始化)
+        // 网页加载
         try {
             Method load1 = WebView.class.getDeclaredMethod("loadUrl", String.class);
             hook(load1).intercept(chain -> {
@@ -295,7 +414,22 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook Dialog 失败", t);
         }
 
-        // 页面显示:启动自动签到 + 记录控件树
+        // 离开页面时复制一次记录(弹窗出现后按 Home 键回聊天即可粘贴)
+        try {
+            Method onPause = Activity.class.getDeclaredMethod("onPause");
+            hook(onPause).intercept(chain -> {
+                try {
+                    Object self = chain.getThisObject();
+                    if (self instanceof Activity) copyRecord((Activity) self);
+                } catch (Throwable ignored) {
+                }
+                return chain.proceed();
+            });
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hook onPause 失败", t);
+        }
+
+        // 页面显示:自动签到 / 跳过开屏 / 记录控件树
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
@@ -310,6 +444,14 @@ public class ComicModule extends XposedModule {
                         if (AUTO_CHECKIN && !autoStarted && MAIN_ACTIVITY.equals(name)) {
                             autoStarted = true;
                             decor.postDelayed(() -> startAutoCheckin(act), 1500);
+                        }
+
+                        if (SKIP_SPLASH && SPLASH_ACTIVITY.equals(name)
+                                && !splashStartedMain
+                                && skipped.add(System.identityHashCode(act))) {
+                            decor.postDelayed(() -> {
+                                if (!splashStartedMain) skipSplash(act);
+                            }, 400);
                         }
 
                         final boolean splash = name.toLowerCase().contains("splash");
