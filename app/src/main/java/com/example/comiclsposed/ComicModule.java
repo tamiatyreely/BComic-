@@ -1,7 +1,6 @@
 package com.example.comiclsposed;
 
 import android.app.Activity;
-import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -17,14 +16,15 @@ import android.webkit.WebView;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 
-import java.lang.reflect.Field;
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.Calendar;
 import java.util.Date;
-import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 
 import io.github.libxposed.api.XposedModule;
@@ -35,11 +35,10 @@ public class ComicModule extends XposedModule {
     private static final int MAX_CHARS = 60000;
 
     // ===== 开关 =====
-    private static final boolean AUTO_CHECKIN = true;     // 自动签到
-    private static final boolean BLOCK_ADS = true;        // 拦截开屏广告和弹窗(实验性)
-    private static final boolean DEBUG_CLIPBOARD = true;  // 签到结束时把记录复制到剪贴板(调试用)
+    private static final boolean AUTO_CHECKIN = true;     // 自动签到(每天只执行一次)
+    private static final boolean BLOCK_ADS = true;        // 拦截开屏广告和弹窗
+    private static final boolean DEBUG_CLIPBOARD = true;  // 把运行记录复制到剪贴板(确认没问题后改成 false)
 
-    // 被拦截的接口、被清空的本地缓存
     private static final String[] BLOCK_API = {"Comic/ListFlash", "Comic/GetOperaterBanner"};
     private static final String[] BLOCK_PREF_KEYS = {"previous_splash_cache"};
 
@@ -54,12 +53,18 @@ public class ComicModule extends XposedModule {
             + "for(var i=0;i<e.length;i++){var u=e[i].name,t=e[i].initiatorType;"
             + "if(t==='xmlhttprequest'||t==='fetch'){n.push(u.split('?')[0].split('/').pop());}"
             + "if(u.indexOf('Activity/ClockIn?')>-1){s.push(String(e[i].responseStatus));}}"
-            + "var x=((document.body&&document.body.innerText)||'').replace(/\\s+/g,' ').substring(0,150);"
-            + "return 'clock='+s.join(',')+'|api='+n.join(',')+'|txt='+x;"
+            + "var tx=(document.body&&document.body.innerText)||'';"
+            + "var g=(tx.match(/已获得/g)||[]).length;"
+            + "return 'n='+e.length+'|clock='+s.join(',')+'|got='+g+'|api='+n.join(',');"
             + "}catch(z){return 'err='+z;}})()";
 
+    // Flutter 标准编码:失败回复 / 空成功回复
+    private static final byte[] ERROR_ENVELOPE = buildErrorEnvelope();
+    private static final byte[] NULL_SUCCESS = new byte[]{0, 0};
+
     private final StringBuilder record = new StringBuilder();
-    private final Set<String> hookedHandlers = new HashSet<>();
+    private Method respondMethod;
+    private Method cleanupMethod;
     private boolean autoStarted = false;
 
     @Override
@@ -68,6 +73,19 @@ public class ComicModule extends XposedModule {
     }
 
     // ---------- 工具方法 ----------
+
+    private static byte[] buildErrorEnvelope() {
+        byte[] msg = "blocked".getBytes(StandardCharsets.US_ASCII);
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        o.write(1);
+        for (int i = 0; i < 2; i++) {
+            o.write(7);
+            o.write(msg.length);
+            o.write(msg, 0, msg.length);
+        }
+        o.write(0);
+        return o.toByteArray();
+    }
 
     private static String scrub(String s) {
         if (s == null) return "null";
@@ -103,121 +121,120 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    // ---------- 拦截开屏广告和弹窗 ----------
+    private static String field(String v, String key) {
+        int a = v.indexOf(key + "=");
+        if (a < 0) return "";
+        a += key.length() + 1;
+        int b = v.indexOf('|', a);
+        if (b < 0) b = v.length();
+        return v.substring(a, b).replace("\"", "").trim();
+    }
 
-    private void hookMethodChannel(ClassLoader cl) {
+    private static int toInt(String s) {
         try {
-            Class<?> mc = Class.forName("io.flutter.plugin.common.MethodChannel", false, cl);
-
-            Field nf = null;
-            try {
-                nf = mc.getDeclaredField("name");
-            } catch (Throwable ignored) {
-                for (Field f : mc.getDeclaredFields()) {
-                    if (f.getType() == String.class) {
-                        nf = f;
-                        break;
-                    }
-                }
-            }
-            if (nf == null) {
-                note("【拦截】找不到 MethodChannel 的名字字段");
-                return;
-            }
-            nf.setAccessible(true);
-            final Field nameField = nf;
-
-            Method set = null;
-            for (Method m : mc.getDeclaredMethods()) {
-                if (m.getName().equals("setMethodCallHandler")) {
-                    set = m;
-                    break;
-                }
-            }
-            if (set == null) {
-                note("【拦截】找不到 setMethodCallHandler");
-                return;
-            }
-
-            hook(set).intercept(chain -> {
-                Object result = chain.proceed();
-                try {
-                    Object ch = chain.getThisObject();
-                    Object handler = chain.getArg(0);
-                    if (ch != null && handler != null) {
-                        String name = String.valueOf(nameField.get(ch));
-                        if (name.equals("httpclient") || name.equals("c.b/basic")) {
-                            hookHandler(handler.getClass(), name);
-                        }
-                    }
-                } catch (Throwable t) {
-                    note("【拦截】处理 handler 出错: " + t);
-                }
-                return result;
-            });
-            note("【拦截】已监听 MethodChannel");
+            return Integer.parseInt(s.trim());
         } catch (Throwable t) {
-            note("【拦截】MethodChannel 监听失败: " + t);
+            return 0;
         }
     }
 
-    private void hookHandler(Class<?> cls, String channel) {
-        synchronized (hookedHandlers) {
-            if (!hookedHandlers.add(cls.getName())) return;
-        }
-        int n = 0;
-        for (Method m : cls.getDeclaredMethods()) {
-            if (!m.getName().equals("onMethodCall") || m.getParameterTypes().length != 2) continue;
+    // ---------- 拦截开屏广告和弹窗(FlutterJNI 层) ----------
+
+    private void hookFlutterJni(ClassLoader cl) {
+        try {
+            Class<?> jni = Class.forName("io.flutter.embedding.engine.FlutterJNI", false, cl);
             try {
+                respondMethod = jni.getDeclaredMethod("invokePlatformMessageResponseCallback",
+                        int.class, ByteBuffer.class, int.class);
+                respondMethod.setAccessible(true);
+            } catch (Throwable t) {
+                note("【拦截】找不到回复方法: " + t);
+                return;
+            }
+            try {
+                cleanupMethod = jni.getDeclaredMethod("cleanupMessageData", long.class);
+                cleanupMethod.setAccessible(true);
+            } catch (Throwable ignored) {
+                cleanupMethod = null;
+            }
+            int n = 0;
+            for (Method m : jni.getDeclaredMethods()) {
+                if (!m.getName().equals("handlePlatformMessage")) continue;
                 hook(m).intercept(chain -> {
-                    if (BLOCK_ADS && tryBlock(chain.getArg(0), chain.getArg(1))) {
-                        return null;
+                    try {
+                        if (BLOCK_ADS) {
+                            Object a3 = null;
+                            try {
+                                a3 = chain.getArg(3);
+                            } catch (Throwable ignored) {
+                            }
+                            if (tryBlock(chain.getThisObject(), chain.getArg(0),
+                                    chain.getArg(1), chain.getArg(2), a3)) {
+                                return null;
+                            }
+                        }
+                    } catch (Throwable t) {
+                        note("【拦截】出错: " + t);
                     }
                     return chain.proceed();
                 });
                 n++;
-            } catch (Throwable t) {
-                note("【拦截】hook 失败: " + t);
             }
+            note("【拦截】已监听 FlutterJNI x" + n);
+        } catch (Throwable t) {
+            note("【拦截】FlutterJNI 监听失败(非主进程可忽略): " + t);
         }
-        note("【拦截】" + channel + " 的处理类: " + cls.getName() + " (hook x" + n + ")");
     }
 
-    private boolean tryBlock(Object call, Object result) {
-        try {
-            if (call == null || result == null) return false;
-            Class<?> cc = call.getClass();
-            String method = String.valueOf(cc.getField("method").get(call));
-            String args = String.valueOf(cc.getField("arguments").get(call));
-            ClassLoader cl = cc.getClassLoader();
+    private boolean tryBlock(Object jni, Object chObj, Object msgObj, Object idObj, Object dataObj)
+            throws Exception {
+        if (jni == null || respondMethod == null) return false;
+        if (!(chObj instanceof String) || !(msgObj instanceof ByteBuffer)
+                || !(idObj instanceof Integer)) return false;
+        String ch = (String) chObj;
+        boolean isHttp = ch.equals("httpclient");
+        boolean isBasic = ch.equals("c.b/basic");
+        if (!isHttp && !isBasic) return false;
 
-            if ("send".equals(method)) {
-                for (String api : BLOCK_API) {
-                    if (args.contains(api)) {
-                        Class<?> rc = Class.forName("io.flutter.plugin.common.MethodChannel$Result", false, cl);
-                        rc.getMethod("error", String.class, String.class, Object.class)
-                                .invoke(result, "blocked", "blocked by module", null);
-                        note("【拦截】已拦截请求 " + api);
-                        return true;
-                    }
-                }
-            } else if ("getPreference".equals(method)) {
-                for (String k : BLOCK_PREF_KEYS) {
-                    if (args.contains(k)) {
-                        Class<?> rc = Class.forName("io.flutter.plugin.common.MethodChannel$Result", false, cl);
-                        rc.getMethod("success", Object.class).invoke(result, (Object) null);
-                        note("【拦截】已清空缓存 " + k);
-                        return true;
-                    }
+        ByteBuffer bb = ((ByteBuffer) msgObj).duplicate();
+        byte[] b = new byte[bb.remaining()];
+        bb.get(b);
+        String s = new String(b, StandardCharsets.ISO_8859_1);
+        int id = (Integer) idObj;
+
+        if (isHttp) {
+            for (String api : BLOCK_API) {
+                if (s.contains(api)) {
+                    respond(jni, id, ERROR_ENVELOPE, dataObj);
+                    note("【拦截】已拦截请求 " + api);
+                    return true;
                 }
             }
-        } catch (Throwable t) {
-            note("【拦截】判断出错: " + t);
+        } else if (s.contains("getPreference")) {
+            for (String k : BLOCK_PREF_KEYS) {
+                if (s.contains(k)) {
+                    respond(jni, id, NULL_SUCCESS, dataObj);
+                    note("【拦截】已清空缓存 " + k);
+                    return true;
+                }
+            }
         }
         return false;
     }
 
-    // ---------- 自动签到 ----------
+    private void respond(Object jni, int id, byte[] data, Object msgData) throws Exception {
+        ByteBuffer d = ByteBuffer.allocateDirect(data.length);
+        d.put(data);
+        respondMethod.invoke(jni, id, d, data.length);
+        if (cleanupMethod != null && msgData instanceof Long) {
+            try {
+                cleanupMethod.invoke(jni, msgData);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // ---------- 自动签到(每天只执行一次) ----------
 
     private void startAutoCheckin(final Activity act) {
         try {
@@ -231,7 +248,10 @@ public class ComicModule extends XposedModule {
             final String ua = sp.getString("ua", "");
             if (ua.isEmpty()) {
                 note("【自动签到】还没有初始化");
-                toast(act, "自动签到:请先手动打开一次营销中心完成初始化");
+                if (!today.equals(sp.getString("warn_date", ""))) {
+                    sp.edit().putString("warn_date", today).apply();
+                    toast(act, "自动签到:请先手动打开一次营销中心完成初始化");
+                }
                 return;
             }
             final ViewGroup decor = (ViewGroup) act.getWindow().getDecorView();
@@ -257,7 +277,11 @@ public class ComicModule extends XposedModule {
                                 final SharedPreferences sp, final String today) {
         final Handler h = new Handler(Looper.getMainLooper());
         final boolean[] finished = {false};
-        final long[] delays = {5000, 9000, 13000, 18000};
+        final long[] delays = {6000, 10000, 15000, 20000};
+
+        int dow = Calendar.getInstance().get(Calendar.DAY_OF_WEEK);   // 周日=1 ... 周六=7
+        final int dayIdx = (dow == Calendar.SUNDAY) ? 7 : dow - 1;     // 周一=1 ... 周日=7
+
         for (int i = 0; i < delays.length; i++) {
             final boolean lastCheck = (i == delays.length - 1);
             h.postDelayed(() -> {
@@ -267,23 +291,28 @@ public class ComicModule extends XposedModule {
                         if (finished[0]) return;
                         String v = value == null ? "" : value;
                         note("【自动签到】检查: " + v);
-                        int a = v.indexOf("clock=");
-                        int b = a < 0 ? -1 : v.indexOf('|', a);
-                        String tail = a < 0 ? "" : v.substring(a + 6, b < 0 ? v.length() : b).trim();
-                        if (!tail.isEmpty()) {
+                        String clock = field(v, "clock");
+                        int n = toInt(field(v, "n"));
+                        int got = toInt(field(v, "got"));
+
+                        if (!clock.isEmpty()) {
                             finished[0] = true;
-                            if (tail.contains("200")) {
+                            if (clock.contains("200")) {
                                 sp.edit().putString("ok_date", today).apply();
-                                toast(act, "✅ 营销中心自动签到完成");
+                                toast(act, "✅ 今日自动签到完成");
                             } else {
-                                toast(act, "签到请求已发出,状态: " + tail);
+                                toast(act, "自动签到失败(状态 " + clock + "),下次打开会重试");
                             }
-                            copyRecord(act);
                             cleanup(decor, wv);
                         } else if (lastCheck) {
                             finished[0] = true;
-                            toast(act, "后台已打开营销中心,但没检测到签到请求");
-                            copyRecord(act);
+                            if (n >= 20 && got >= dayIdx) {
+                                sp.edit().putString("ok_date", today).apply();
+                                note("【自动签到】页面显示今天已签到,记为完成");
+                            } else if (!today.equals(sp.getString("warn_date", ""))) {
+                                sp.edit().putString("warn_date", today).apply();
+                                toast(act, "自动签到未生效,请手动点一次营销中心");
+                            }
                             cleanup(decor, wv);
                         }
                     });
@@ -311,7 +340,7 @@ public class ComicModule extends XposedModule {
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
-        hookMethodChannel(param.getClassLoader());
+        hookFlutterJni(param.getClassLoader());
 
         // 页面创建(只记录)
         try {
@@ -329,7 +358,7 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook onCreate 失败", t);
         }
 
-        // 网页加载:记录;用户手动打开营销中心时保存网页环境(初始化)
+        // 网页加载:你手动打开营销中心时,保存网页环境(初始化)
         try {
             Method load1 = WebView.class.getDeclaredMethod("loadUrl", String.class);
             hook(load1).intercept(chain -> {
@@ -345,21 +374,6 @@ public class ComicModule extends XposedModule {
             log(Log.ERROR, TAG, "hook WebView 失败", t);
         }
 
-        // 原生弹窗(只记录)
-        try {
-            Method show = Dialog.class.getDeclaredMethod("show");
-            hook(show).intercept(chain -> {
-                try {
-                    Object self = chain.getThisObject();
-                    if (self != null) note("【弹窗】" + self.getClass().getName());
-                } catch (Throwable ignored) {
-                }
-                return chain.proceed();
-            });
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook Dialog 失败", t);
-        }
-
         // 进入主页后启动自动签到
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
@@ -369,11 +383,16 @@ public class ComicModule extends XposedModule {
                     Object self = chain.getThisObject();
                     if (self instanceof Activity) {
                         final Activity act = (Activity) self;
-                        if (AUTO_CHECKIN && !autoStarted
-                                && MAIN_ACTIVITY.equals(act.getClass().getName())) {
+                        if (!autoStarted && MAIN_ACTIVITY.equals(act.getClass().getName())) {
                             autoStarted = true;
                             View decor = act.getWindow().getDecorView();
-                            decor.postDelayed(() -> startAutoCheckin(act), 1500);
+                            if (AUTO_CHECKIN) {
+                                decor.postDelayed(() -> startAutoCheckin(act), 1500);
+                            }
+                            if (DEBUG_CLIPBOARD) {
+                                decor.postDelayed(() -> copyRecord(act), 10000);
+                                decor.postDelayed(() -> copyRecord(act), 24000);
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
