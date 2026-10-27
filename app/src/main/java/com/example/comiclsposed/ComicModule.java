@@ -35,25 +35,32 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 public class ComicModule extends XposedModule {
     private static final String TAG = "ComicModule";
-    private static final int MAX_CHARS = 70000;
+    private static final int MAX_CHARS = 100000;
 
     // ===== 开关 =====
     private static final boolean AUTO_CHECKIN = true;     // 自动签到(每天最多提示一次)
     private static final boolean BLOCK_ADS = true;        // 拦截开屏广告和弹窗
     private static final boolean DEBUG_CLIPBOARD = true;  // 把运行记录复制到剪贴板(调试用)
+    private static final boolean FILTER_HOME_TABS = true; // 首页顶部标签只保留下面列出的
 
     private static final String[] BLOCK_API = {"Comic/ListFlash", "Comic/GetOperaterBanner"};
     private static final String[] BLOCK_PREF_KEYS = {"previous_splash_cache"};
 
-    // 调试:记录这些接口的返回内容,用来研究底栏/顶部标签
-    private static final String[] LOG_RESP = {
-            "GetActivityTab", "GetClassPageAllTabs", "AppInit", "GetConf", "GetBubbles",
-            "GetWelfareBanner", "GetInitInfo", "GetMarketingCenterInfo", "TabRedDot"};
+    // 首页顶部标签:名字里包含这些词的才保留
+    private static final String[] KEEP_HOME_TABS = {"关注", "精选", "推荐"};
+
+    // 调试:返回内容里出现这些词时,记录该接口和附近内容(用来找商城/畅读卡横幅的来源)
+    private static final String[] KEYWORDS = {"畅读卡", "商城", "mall"};
+    // 调试:这些接口多记录一些内容
+    private static final String[] BIG_API = {"AppInit", "GetABFlags", "GetInitInfo"};
 
     private static final String PREF = "comic_mod";
     private static final String HIDDEN_TAG = "cm_hidden";
@@ -234,6 +241,112 @@ public class ComicModule extends XposedModule {
         return sb.toString();
     }
 
+    // ---- Flutter 回复里的 body 字符串:定位 / 替换 / 改写 ----
+
+    // 找到 "body" 这个键对应的字符串,返回 {长度字段起点, 字符串起点, 字符串字节数}
+    private static int[] findBody(byte[] b, int len) {
+        for (int i = 0; i + 8 < len; i++) {
+            if (b[i] == 7 && b[i + 1] == 4 && b[i + 2] == 'b' && b[i + 3] == 'o'
+                    && b[i + 4] == 'd' && b[i + 5] == 'y' && (b[i + 6] == 7 || b[i + 6] == 8)) {
+                int p = i + 7;
+                int sz = b[p] & 0xff;
+                int off = p + 1;
+                if (sz == 254) {
+                    if (p + 2 >= len) return null;
+                    sz = (b[p + 1] & 0xff) | ((b[p + 2] & 0xff) << 8);
+                    off = p + 3;
+                } else if (sz == 255) {
+                    if (p + 4 >= len) return null;
+                    sz = (b[p + 1] & 0xff) | ((b[p + 2] & 0xff) << 8)
+                            | ((b[p + 3] & 0xff) << 16) | ((b[p + 4] & 0xff) << 24);
+                    off = p + 5;
+                }
+                if (sz >= 0 && off + sz <= len) return new int[]{p, off, sz};
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static void writeSize(ByteArrayOutputStream o, int n) {
+        if (n < 254) {
+            o.write(n);
+        } else if (n <= 0xffff) {
+            o.write(254);
+            o.write(n & 0xff);
+            o.write((n >> 8) & 0xff);
+        } else {
+            o.write(255);
+            o.write(n & 0xff);
+            o.write((n >> 8) & 0xff);
+            o.write((n >> 16) & 0xff);
+            o.write((n >> 24) & 0xff);
+        }
+    }
+
+    // 用新的 body 字符串替换旧的,其余字节原样保留
+    private static byte[] replaceBody(byte[] b, int len, int[] loc, String newBody) {
+        byte[] nb = newBody.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream o = new ByteArrayOutputStream(len + 64);
+        o.write(b, 0, loc[0]);
+        writeSize(o, nb.length);
+        o.write(nb, 0, nb.length);
+        int tail = loc[1] + loc[2];
+        o.write(b, tail, len - tail);
+        return o.toByteArray();
+    }
+
+    // 首页顶部标签过滤:返回改写后的 JSON,不需要改写时返回 null。info 里写说明文字
+    private static String rewriteTabs(String json, StringBuilder info) {
+        try {
+            JSONObject root = new JSONObject(json);
+            JSONObject data = root.optJSONObject("data");
+            if (data == null) return null;
+            JSONArray arr = data.optJSONArray("home_type");
+            if (arr == null || arr.length() == 0) return null;
+            JSONArray keep = new JSONArray();
+            StringBuilder kept = new StringBuilder();
+            StringBuilder dropped = new StringBuilder();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                String name = o == null ? "" : o.optString("name", "");
+                boolean ok = false;
+                for (String k : KEEP_HOME_TABS) {
+                    if (name.contains(k)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                if (ok) {
+                    keep.put(o);
+                    kept.append(name).append(' ');
+                } else {
+                    dropped.append(name).append(' ');
+                }
+            }
+            if (keep.length() == 0) {
+                info.append("没有匹配的标签,保持原样。原有: ").append(dropped);
+                return null;
+            }
+            if (keep.length() == arr.length()) {
+                info.append("标签本来就只有: ").append(kept);
+                return null;
+            }
+            data.put("home_type", keep);
+            info.append("保留: ").append(kept).append("| 移除: ").append(dropped);
+            return root.toString();
+        } catch (Throwable t) {
+            info.append("改写失败: ").append(t);
+            return null;
+        }
+    }
+
+    private static String snippet(String s, int idx, int before, int after) {
+        int a = Math.max(0, idx - before);
+        int b = Math.min(s.length(), idx + after);
+        return s.substring(a, b);
+    }
+
     private static String apiName(String url) {
         int i = url.indexOf("twirp/");
         if (i < 0) return null;
@@ -271,7 +384,7 @@ public class ComicModule extends XposedModule {
                 cleanupMethod = null;
             }
 
-            // 记录部分接口的返回内容(调试;失败不影响拦截功能)
+            // 处理接口返回:记录(调试)+ 改写首页标签;失败不影响拦截功能
             try {
                 hook(respondMethod).intercept(chain -> {
                     try {
@@ -279,15 +392,18 @@ public class ComicModule extends XposedModule {
                         if (idObj instanceof Integer) {
                             String api = pending.remove(idObj);
                             if (api != null) {
-                                logResponse(api, chain.getArg(1), chain.getArg(2));
+                                Object[] repl = handleResponse((Integer) idObj, api,
+                                        chain.getArg(1), chain.getArg(2));
+                                if (repl != null) return chain.proceed(repl);
                             }
                         }
-                    } catch (Throwable ignored) {
+                    } catch (Throwable t) {
+                        note("【返回】处理出错: " + t);
                     }
                     return chain.proceed();
                 });
             } catch (Throwable t) {
-                note("【拦截】记录返回内容失败: " + t);
+                note("【拦截】处理返回内容失败: " + t);
             }
 
             int n = 0;
@@ -317,15 +433,60 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    private void logResponse(String api, Object msgObj, Object posObj) {
-        if (!(msgObj instanceof ByteBuffer) || !(posObj instanceof Integer)) return;
+    // 返回 null 表示不改动;否则返回替换后的参数
+    private Object[] handleResponse(Integer id, String api, Object msgObj, Object posObj) {
+        if (!(msgObj instanceof ByteBuffer) || !(posObj instanceof Integer)) return null;
         ByteBuffer bb = ((ByteBuffer) msgObj).duplicate();
         int len = Math.min((Integer) posObj, bb.capacity());
-        if (len <= 0) return;
+        if (len <= 0) return null;
         bb.rewind();
         byte[] b = new byte[len];
         bb.get(b, 0, len);
-        note("【返回】" + api + " (" + len + "字节) " + readable(b, len, 1500));
+
+        if (api.startsWith("fawkes:")) {
+            if (bump("fk:" + api) <= 1) note("【配置值】" + api + " => " + readable(b, len, 300));
+            return null;
+        }
+
+        int[] loc = findBody(b, len);
+        if (loc == null) {
+            if (bump("nb:" + api) <= 1) note("【接口】" + api + " (没找到body) " + readable(b, len, 120));
+            return null;
+        }
+        String body = new String(b, loc[1], loc[2], StandardCharsets.UTF_8);
+
+        // 记录:每个接口首次出现时记一次
+        boolean big = false;
+        for (String k : BIG_API) {
+            if (api.endsWith("/" + k)) big = true;
+        }
+        int maxN = (api.endsWith("/GetABFlags") || api.endsWith("/GetConf")) ? 4 : 1;
+        int n = bump("api:" + api);
+        if (n <= maxN) {
+            int cap = big ? (api.endsWith("/GetABFlags") ? 800 : 4500) : 300;
+            note("【接口】" + api + " (" + loc[2] + "字符) " + (body.length() > cap ? body.substring(0, cap) : body));
+        }
+        // 关键词:出现商城/畅读卡时,记录附近内容
+        for (String kw : KEYWORDS) {
+            int idx = body.indexOf(kw);
+            if (idx >= 0 && bump("kw:" + api + kw) <= 1) {
+                note("【关键词 " + kw + "】" + api + " ..." + snippet(body, idx, 400, 700));
+            }
+        }
+
+        // 改写:首页顶部标签
+        if (FILTER_HOME_TABS && api.endsWith("/GetClassPageAllTabs")) {
+            StringBuilder info = new StringBuilder();
+            String nj = rewriteTabs(body, info);
+            if (bump("tabnote") <= 3) note("【标签】" + info);
+            if (nj != null) {
+                byte[] nb = replaceBody(b, len, loc, nj);
+                ByteBuffer d = ByteBuffer.allocateDirect(nb.length);
+                d.put(nb);
+                return new Object[]{id, d, nb.length};
+            }
+        }
+        return null;
     }
 
     // 返回 true 表示这条消息被拦截,不再交给 App
@@ -345,10 +506,11 @@ public class ComicModule extends XposedModule {
         int id = (Integer) idObj;
 
         if (isFawkes) {
-            List<String> ss = decodeStrings(b);
-            String line = String.join(" ", ss);
-            if (line.length() > 120) line = line.substring(0, 120);
-            if (seen.add("fk:" + line)) note("【配置项】" + line);
+            String line = String.join(" ", decodeStrings(b));
+            if (line.contains("goods.dynamic") || line.contains("strategy.show")
+                    || line.contains("flutter.skin_replace") || line.contains("config.animated_cover")) {
+                pending.put(id, "fawkes:" + line);
+            }
             return false;
         }
 
@@ -367,13 +529,7 @@ public class ComicModule extends XposedModule {
             for (String str : decodeStrings(b)) {
                 String api = apiName(str);
                 if (api == null) continue;
-                for (String want : LOG_RESP) {
-                    if (api.endsWith("/" + want)) {
-                        if (bump("resp:" + want) <= (want.equals("GetConf") ? 4 : 2)) {
-                            pending.put(id, api);
-                        }
-                    }
-                }
+                pending.put(id, api);
                 break;
             }
             return false;
@@ -616,8 +772,10 @@ public class ComicModule extends XposedModule {
                                 decor.postDelayed(() -> startAutoCheckin(act), 1500);
                             }
                             if (DEBUG_CLIPBOARD) {
-                                decor.postDelayed(() -> copyRecord(act), 12000);
-                                decor.postDelayed(() -> copyRecord(act), 26000);
+                                long[] cps = {12000, 26000, 45000, 70000, 100000};
+                                for (long c : cps) {
+                                    decor.postDelayed(() -> copyRecord(act), c);
+                                }
                             }
                         }
                     }
