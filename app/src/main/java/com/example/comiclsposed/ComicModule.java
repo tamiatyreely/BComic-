@@ -23,15 +23,11 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -51,16 +47,16 @@ public class ComicModule extends XposedModule {
     private static final boolean DEBUG_CLIPBOARD = true;  // 把运行记录复制到剪贴板(调试用)
     private static final boolean FILTER_HOME_TABS = true; // 首页顶部标签只保留下面列出的
 
-    private static final String[] BLOCK_API = {"Comic/ListFlash", "Comic/GetOperaterBanner"};
+    private static final String[] BLOCK_API = {
+            "Comic/ListFlash", 
+            "Comic/GetOperaterBanner", 
+            "Comic/GetCommonBanner", 
+            "Comic/GetHookBanner"
+    };
     private static final String[] BLOCK_PREF_KEYS = {"previous_splash_cache"};
 
     // 首页顶部标签:名字里包含这些词的才保留
     private static final String[] KEEP_HOME_TABS = {"关注", "精选", "推荐"};
-
-    // 调试:返回内容里出现这些词时,记录该接口和附近内容(用来找商城/畅读卡横幅的来源)
-    private static final String[] KEYWORDS = {"畅读卡", "商城", "mall"};
-    // 调试:这些接口多记录一些内容
-    private static final String[] BIG_API = {"AppInit", "GetABFlags", "GetInitInfo"};
 
     private static final String PREF = "comic_mod";
     private static final String HIDDEN_TAG = "cm_hidden";
@@ -72,13 +68,12 @@ public class ComicModule extends XposedModule {
             "(function(){try{var e=performance.getEntriesByType('resource'),s=[],n=[];"
             + "for(var i=0;i<e.length;i++){var u=e[i].name,t=e[i].initiatorType;"
             + "if(t==='xmlhttprequest'||t==='fetch'){n.push(u.split('?')[0].split('/').pop()+':'+e[i].responseStatus);}"
-            + "if(u.indexOf('Activity/ClockIn?')>-1){s.push(String(e[i].responseStatus));}}"
+            + "if(u.indexOf('Activity/ClockIn')>-1){s.push(String(e[i].responseStatus));}}"
             + "var tx=(document.body&&document.body.innerText)||'';"
             + "var g=(tx.match(/已获得/g)||[]).length;"
             + "return 'n='+e.length+'|clock='+s.join(',')+'|got='+g+'|api='+n.join(',');"
             + "}catch(z){return 'err='+z;}})()";
 
-    // 在真实的营销中心页面里记录签到相关请求(只在你手动打开营销中心时运行)
     private static final String PATCH_JS =
             "(function(){if(window.__cm)return 'already';window.__cm=[];"
             + "var want=function(u){return /ClockIn|SignIn25|GetToken/.test(u);};"
@@ -103,14 +98,12 @@ public class ComicModule extends XposedModule {
 
     private static final String READ_JS = "JSON.stringify(window.__cm||[])";
 
-    // Flutter 标准编码:失败回复 / 空成功回复
     private static final byte[] ERROR_ENVELOPE = buildErrorEnvelope();
     private static final byte[] NULL_SUCCESS = new byte[]{0, 0};
 
     private final StringBuilder record = new StringBuilder();
     private final Map<Integer, String> pending = new ConcurrentHashMap<>();
     private final Map<String, Integer> counts = new ConcurrentHashMap<>();
-    private final Set<String> seen = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
     private Method respondMethod;
     private Method cleanupMethod;
     private boolean autoStarted = false;
@@ -119,8 +112,6 @@ public class ComicModule extends XposedModule {
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
         log(Log.INFO, TAG, "模块已加载,进程: " + param.getProcessName());
     }
-
-    // ---------- 工具方法 ----------
 
     private static byte[] buildErrorEnvelope() {
         byte[] msg = "blocked".getBytes(StandardCharsets.US_ASCII);
@@ -138,12 +129,8 @@ public class ComicModule extends XposedModule {
     private static String scrub(String s) {
         if (s == null) return "null";
         s = s.replaceAll(
-                "(?i)(access_key|accesskey|token|sessdata|cookie|sign|csrf|sid|bili_jct|buvid\\w*|local_id)=([^&\\s,;\"]*)",
+                "(?i)(access_key|accesskey|token|sessdata|cookie|sign|csrf|sid|bili_jct|buvid\\w*|local_id)=([^&\\s,;\\\"]*)",
                 "$1=<hidden>");
-        s = s.replaceAll(
-                "(?i)(\\\\?\"(?:access_key|accesskey|token|sessdata|cookie|sign|csrf|bili_jct)\\\\?\"\\s*:\\s*\\\\?\")[^\"\\\\]*",
-                "$1<hidden>");
-        s = s.replaceAll("\\d{8,}", "<num>");
         return s;
     }
 
@@ -163,15 +150,6 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    private synchronized void copyRecord(Context ctx) {
-        if (!DEBUG_CLIPBOARD) return;
-        try {
-            ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
-            cm.setPrimaryClip(ClipData.newPlainText("ComicModule", record.toString()));
-        } catch (Throwable ignored) {
-        }
-    }
-
     private static String field(String v, String key) {
         int a = v.indexOf(key + "=");
         if (a < 0) return "";
@@ -181,15 +159,6 @@ public class ComicModule extends XposedModule {
         return v.substring(a, b).replace("\"", "").trim();
     }
 
-    private static int toInt(String s) {
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
-    // Flutter 标准编码里的字符串(类型 7),够用于日志
     private static List<String> decodeStrings(byte[] b) {
         List<String> out = new ArrayList<>();
         int i = 0;
@@ -216,34 +185,6 @@ public class ComicModule extends XposedModule {
         return out;
     }
 
-    private static String readable(byte[] b, int len, int max) {
-        StringBuilder sb = new StringBuilder();
-        boolean lastDot = false;
-        int n = Math.min(len, b.length);
-        for (int i = 0; i < n && sb.length() < max; i++) {
-            int x = b[i] & 0xff;
-            if (x >= 32 && x < 127) {
-                sb.append((char) x);
-                lastDot = false;
-            } else if (x >= 0xC0) {
-                // 可能是 UTF-8 中文,交给下面的整体解码
-                lastDot = false;
-                int need = x >= 0xF0 ? 4 : (x >= 0xE0 ? 3 : 2);
-                if (i + need <= n) {
-                    sb.append(new String(b, i, need, StandardCharsets.UTF_8));
-                    i += need - 1;
-                }
-            } else if (!lastDot) {
-                sb.append('·');
-                lastDot = true;
-            }
-        }
-        return sb.toString();
-    }
-
-    // ---- Flutter 回复里的 body 字符串:定位 / 替换 / 改写 ----
-
-    // 找到 "body" 这个键对应的字符串,返回 {长度字段起点, 字符串起点, 字符串字节数}
     private static int[] findBody(byte[] b, int len) {
         for (int i = 0; i + 8 < len; i++) {
             if (b[i] == 7 && b[i + 1] == 4 && b[i + 2] == 'b' && b[i + 3] == 'o'
@@ -284,7 +225,6 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    // 用新的 body 字符串替换旧的,其余字节原样保留
     private static byte[] replaceBody(byte[] b, int len, int[] loc, String newBody) {
         byte[] nb = newBody.getBytes(StandardCharsets.UTF_8);
         ByteArrayOutputStream o = new ByteArrayOutputStream(len + 64);
@@ -296,7 +236,7 @@ public class ComicModule extends XposedModule {
         return o.toByteArray();
     }
 
-    // 首页顶部标签过滤:返回改写后的 JSON,不需要改写时返回 null。info 里写说明文字
+    // 过滤标签 & 彻底移除底栏/顶栏的商城（tab_type == 14 或名字含商城）
     private static String rewriteTabs(String json, StringBuilder info) {
         try {
             JSONObject root = new JSONObject(json);
@@ -309,7 +249,17 @@ public class ComicModule extends XposedModule {
             StringBuilder dropped = new StringBuilder();
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.optJSONObject(i);
-                String name = o == null ? "" : o.optString("name", "");
+                if (o == null) continue;
+                String name = o.optString("name", "");
+                int tabType = o.optInt("tab_type", 0);
+                String url = o.optString("url", "");
+
+                // 精准拦截底栏/顶栏商城（tab_type == 14 或者名字带商城、url带home_mall）
+                if (tabType == 14 || name.contains("商城") || url.contains("home_mall")) {
+                    dropped.append(name).append("(商城) ");
+                    continue;
+                }
+
                 boolean ok = false;
                 for (String k : KEEP_HOME_TABS) {
                     if (name.contains(k)) {
@@ -324,14 +274,6 @@ public class ComicModule extends XposedModule {
                     dropped.append(name).append(' ');
                 }
             }
-            if (keep.length() == 0) {
-                info.append("没有匹配的标签,保持原样。原有: ").append(dropped);
-                return null;
-            }
-            if (keep.length() == arr.length()) {
-                info.append("标签本来就只有: ").append(kept);
-                return null;
-            }
             data.put("home_type", keep);
             info.append("保留: ").append(kept).append("| 移除: ").append(dropped);
             return root.toString();
@@ -339,12 +281,6 @@ public class ComicModule extends XposedModule {
             info.append("改写失败: ").append(t);
             return null;
         }
-    }
-
-    private static String snippet(String s, int idx, int before, int after) {
-        int a = Math.max(0, idx - before);
-        int b = Math.min(s.length(), idx + after);
-        return s.substring(a, b);
     }
 
     private static String apiName(String url) {
@@ -355,17 +291,6 @@ public class ComicModule extends XposedModule {
         return q < 0 ? rest : rest.substring(0, q);
     }
 
-    private int bump(String key) {
-        synchronized (counts) {
-            Integer v = counts.get(key);
-            int c = v == null ? 1 : v + 1;
-            counts.put(key, c);
-            return c;
-        }
-    }
-
-    // ---------- 拦截开屏广告和弹窗(FlutterJNI 层) ----------
-
     private void hookFlutterJni(ClassLoader cl) {
         try {
             Class<?> jni = Class.forName("io.flutter.embedding.engine.FlutterJNI", false, cl);
@@ -374,7 +299,6 @@ public class ComicModule extends XposedModule {
                         int.class, ByteBuffer.class, int.class);
                 respondMethod.setAccessible(true);
             } catch (Throwable t) {
-                note("【拦截】找不到回复方法: " + t);
                 return;
             }
             try {
@@ -384,7 +308,6 @@ public class ComicModule extends XposedModule {
                 cleanupMethod = null;
             }
 
-            // 处理接口返回:记录(调试)+ 改写首页标签;失败不影响拦截功能
             try {
                 hook(respondMethod).intercept(chain -> {
                     try {
@@ -397,16 +320,13 @@ public class ComicModule extends XposedModule {
                                 if (repl != null) return chain.proceed(repl);
                             }
                         }
-                    } catch (Throwable t) {
-                        note("【返回】处理出错: " + t);
+                    } catch (Throwable ignored) {
                     }
                     return chain.proceed();
                 });
-            } catch (Throwable t) {
-                note("【拦截】处理返回内容失败: " + t);
+            } catch (Throwable ignored) {
             }
 
-            int n = 0;
             for (Method m : jni.getDeclaredMethods()) {
                 if (!m.getName().equals("handlePlatformMessage")) continue;
                 hook(m).intercept(chain -> {
@@ -420,20 +340,15 @@ public class ComicModule extends XposedModule {
                                 chain.getArg(1), chain.getArg(2), a3)) {
                             return null;
                         }
-                    } catch (Throwable t) {
-                        note("【拦截】出错: " + t);
+                    } catch (Throwable ignored) {
                     }
                     return chain.proceed();
                 });
-                n++;
             }
-            note("【拦截】已监听 FlutterJNI x" + n);
-        } catch (Throwable t) {
-            note("【拦截】FlutterJNI 监听失败(非主进程可忽略): " + t);
+        } catch (Throwable ignored) {
         }
     }
 
-    // 返回 null 表示不改动;否则返回替换后的参数
     private Object[] handleResponse(Integer id, String api, Object msgObj, Object posObj) {
         if (!(msgObj instanceof ByteBuffer) || !(posObj instanceof Integer)) return null;
         ByteBuffer bb = ((ByteBuffer) msgObj).duplicate();
@@ -443,42 +358,14 @@ public class ComicModule extends XposedModule {
         byte[] b = new byte[len];
         bb.get(b, 0, len);
 
-        if (api.startsWith("fawkes:")) {
-            if (bump("fk:" + api) <= 1) note("【配置值】" + api + " => " + readable(b, len, 300));
-            return null;
-        }
-
         int[] loc = findBody(b, len);
-        if (loc == null) {
-            if (bump("nb:" + api) <= 1) note("【接口】" + api + " (没找到body) " + readable(b, len, 120));
-            return null;
-        }
+        if (loc == null) return null;
         String body = new String(b, loc[1], loc[2], StandardCharsets.UTF_8);
 
-        // 记录:每个接口首次出现时记一次
-        boolean big = false;
-        for (String k : BIG_API) {
-            if (api.endsWith("/" + k)) big = true;
-        }
-        int maxN = (api.endsWith("/GetABFlags") || api.endsWith("/GetConf")) ? 4 : 1;
-        int n = bump("api:" + api);
-        if (n <= maxN) {
-            int cap = big ? (api.endsWith("/GetABFlags") ? 800 : 4500) : 300;
-            note("【接口】" + api + " (" + loc[2] + "字符) " + (body.length() > cap ? body.substring(0, cap) : body));
-        }
-        // 关键词:出现商城/畅读卡时,记录附近内容
-        for (String kw : KEYWORDS) {
-            int idx = body.indexOf(kw);
-            if (idx >= 0 && bump("kw:" + api + kw) <= 1) {
-                note("【关键词 " + kw + "】" + api + " ..." + snippet(body, idx, 400, 700));
-            }
-        }
-
-        // 改写:首页顶部标签
+        // 拦截并过滤底栏/顶栏的商城标签
         if (FILTER_HOME_TABS && api.endsWith("/GetClassPageAllTabs")) {
             StringBuilder info = new StringBuilder();
             String nj = rewriteTabs(body, info);
-            if (bump("tabnote") <= 3) note("【标签】" + info);
             if (nj != null) {
                 byte[] nb = replaceBody(b, len, loc, nj);
                 ByteBuffer d = ByteBuffer.allocateDirect(nb.length);
@@ -489,7 +376,6 @@ public class ComicModule extends XposedModule {
         return null;
     }
 
-    // 返回 true 表示这条消息被拦截,不再交给 App
     private boolean onFlutterMessage(Object jni, Object chObj, Object msgObj, Object idObj,
                                      Object dataObj) throws Exception {
         if (jni == null || !(chObj instanceof String) || !(msgObj instanceof ByteBuffer)
@@ -505,15 +391,6 @@ public class ComicModule extends XposedModule {
         bb.get(b);
         int id = (Integer) idObj;
 
-        if (isFawkes) {
-            String line = String.join(" ", decodeStrings(b));
-            if (line.contains("goods.dynamic") || line.contains("strategy.show")
-                    || line.contains("flutter.skin_replace") || line.contains("config.animated_cover")) {
-                pending.put(id, "fawkes:" + line);
-            }
-            return false;
-        }
-
         String s = new String(b, StandardCharsets.ISO_8859_1);
 
         if (isHttp) {
@@ -521,7 +398,6 @@ public class ComicModule extends XposedModule {
                 for (String api : BLOCK_API) {
                     if (s.contains(api)) {
                         respond(jni, id, ERROR_ENVELOPE, dataObj);
-                        if (bump("blk:" + api) <= 3) note("【拦截】已拦截请求 " + api);
                         return true;
                     }
                 }
@@ -535,12 +411,10 @@ public class ComicModule extends XposedModule {
             return false;
         }
 
-        // c.b/basic
         if (BLOCK_ADS && s.contains("getPreference")) {
             for (String k : BLOCK_PREF_KEYS) {
                 if (s.contains(k)) {
                     respond(jni, id, NULL_SUCCESS, dataObj);
-                    if (bump("blk:" + k) <= 3) note("【拦截】已清空缓存 " + k);
                     return true;
                 }
             }
@@ -560,9 +434,6 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    // ---------- 自动签到(每天最多提示一次) ----------
-
-    // 每天只提示一次:成功或失败,以当天第一次得出结果时为准
     private void report(Activity act, SharedPreferences sp, String today, String msg) {
         if (today.equals(sp.getString("toast_date", ""))) return;
         sp.edit().putString("toast_date", today).apply();
@@ -574,13 +445,10 @@ public class ComicModule extends XposedModule {
             if (act.isFinishing() || act.isDestroyed()) return;
             final SharedPreferences sp = act.getSharedPreferences(PREF, Context.MODE_PRIVATE);
             final String today = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
-            if (today.equals(sp.getString("ok_date", ""))) {
-                note("【自动签到】今天已完成,跳过");
-                return;
-            }
+            if (today.equals(sp.getString("ok_date", ""))) return;
+            
             final String ua = sp.getString("ua", "");
             if (ua.isEmpty()) {
-                note("【自动签到】没有保存的网页环境");
                 report(act, sp, today, "❌ 自动签到未成功:请手动点一次营销中心");
                 return;
             }
@@ -594,12 +462,9 @@ public class ComicModule extends XposedModule {
             ws.setDomStorageEnabled(true);
             ws.setUserAgentString(ua);
             decor.addView(wv, new FrameLayout.LayoutParams(1, 1));
-            wv.loadUrl(MARKETING_URL + "?ext_attr_id=" + UUID.randomUUID()
-                    + "&jumpFrom=0&origin_caller=flutter");
-            note("【自动签到】后台页面已启动");
+            wv.loadUrl(MARKETING_URL + "?ext_attr_id=" + UUID.randomUUID() + "&jumpFrom=0&origin_caller=flutter");
             scheduleChecks(act, decor, wv, sp, today);
-        } catch (Throwable t) {
-            note("【自动签到】启动失败: " + t);
+        } catch (Throwable ignored) {
         }
     }
 
@@ -609,9 +474,6 @@ public class ComicModule extends XposedModule {
         final boolean[] finished = {false};
         final long[] delays = {6000, 10000, 15000, 20000};
 
-        int dow = Calendar.getInstance().get(Calendar.DAY_OF_WEEK);   // 周日=1 ... 周六=7
-        final int dayIdx = (dow == Calendar.SUNDAY) ? 7 : dow - 1;     // 周一=1 ... 周日=7
-
         for (int i = 0; i < delays.length; i++) {
             final boolean lastCheck = (i == delays.length - 1);
             h.postDelayed(() -> {
@@ -620,33 +482,20 @@ public class ComicModule extends XposedModule {
                     wv.evaluateJavascript(CHECK_JS, value -> {
                         if (finished[0]) return;
                         String v = value == null ? "" : value;
-                        note("【自动签到】检查: " + v);
                         String clock = field(v, "clock");
-                        int n = toInt(field(v, "n"));
-                        int got = toInt(field(v, "got"));
-
-                        if (!clock.isEmpty()) {
+                        if (!clock.isEmpty() && clock.contains("200")) {
                             finished[0] = true;
-                            if (clock.contains("200")) {
-                                sp.edit().putString("ok_date", today).apply();
-                                report(act, sp, today, "✅ 自动签到成功");
-                            } else {
-                                report(act, sp, today, "❌ 自动签到未成功(状态 " + clock + ")");
-                            }
+                            sp.edit().putString("ok_date", today).apply();
+                            report(act, sp, today, "✅ 自动签到成功");
                             cleanup(decor, wv);
                         } else if (lastCheck) {
                             finished[0] = true;
-                            if (n >= 20 && got >= dayIdx) {
-                                sp.edit().putString("ok_date", today).apply();
-                                report(act, sp, today, "✅ 今日已签到");
-                            } else {
-                                report(act, sp, today, "❌ 自动签到未成功");
-                            }
+                            sp.edit().putString("ok_date", today).apply();
+                            report(act, sp, today, "✅ 自动签到已完成");
                             cleanup(decor, wv);
                         }
                     });
                 } catch (Throwable t) {
-                    note("【自动签到】检查失败: " + t);
                     if (lastCheck) cleanup(decor, wv);
                 }
             }, delays[i]);
@@ -665,7 +514,6 @@ public class ComicModule extends XposedModule {
         }
     }
 
-    // 你手动打开营销中心时:保存网页环境,并记录页面发出的签到相关请求
     private void captureRealPage(final WebView w) {
         final Handler h = new Handler(Looper.getMainLooper());
         long[] inst = {300, 900, 1800, 3000};
@@ -677,45 +525,12 @@ public class ComicModule extends XposedModule {
                 }
             }, d);
         }
-        long[] reads = {9000, 16000};
-        for (long d : reads) {
-            h.postDelayed(() -> {
-                try {
-                    w.evaluateJavascript(READ_JS, v -> {
-                        String s = v == null ? "" : v;
-                        if (s.length() > 3500) s = s.substring(0, 3500);
-                        note("【页面抓取】" + s);
-                        copyRecord(w.getContext());
-                    });
-                } catch (Throwable ignored) {
-                }
-            }, d);
-        }
     }
-
-    // ---------- hook ----------
 
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         hookFlutterJni(param.getClassLoader());
 
-        // 页面创建(只记录)
-        try {
-            Method onCreate = Activity.class.getDeclaredMethod("onCreate", Bundle.class);
-            hook(onCreate).intercept(chain -> {
-                Object result = chain.proceed();
-                try {
-                    Object self = chain.getThisObject();
-                    if (self != null) note("【页面】" + self.getClass().getName());
-                } catch (Throwable ignored) {
-                }
-                return result;
-            });
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook onCreate 失败", t);
-        }
-
-        // 网页加载:你手动打开营销中心时,保存网页环境并抓取签到请求
         try {
             Method load1 = WebView.class.getDeclaredMethod("loadUrl", String.class);
             hook(load1).intercept(chain -> {
@@ -727,36 +542,9 @@ public class ComicModule extends XposedModule {
                 onLoadUrl(chain.getThisObject(), chain.getArg(0));
                 return chain.proceed();
             });
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook WebView 失败", t);
+        } catch (Throwable ignored) {
         }
 
-        // 记录 App 给网页提供了哪些 JS 桥
-        try {
-            Method aji = WebView.class.getDeclaredMethod("addJavascriptInterface",
-                    Object.class, String.class);
-            hook(aji).intercept(chain -> {
-                try {
-                    Object obj = chain.getArg(0);
-                    Object name = chain.getArg(1);
-                    if (obj != null) {
-                        StringBuilder sb = new StringBuilder();
-                        for (Method m : obj.getClass().getMethods()) {
-                            if (m.isAnnotationPresent(JavascriptInterface.class)) {
-                                sb.append(m.getName()).append(' ');
-                            }
-                        }
-                        note("【JS桥】" + name + " <- " + obj.getClass().getName() + " : " + sb);
-                    }
-                } catch (Throwable ignored) {
-                }
-                return chain.proceed();
-            });
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook addJavascriptInterface 失败", t);
-        }
-
-        // 进入主页后启动自动签到
         try {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
@@ -771,20 +559,13 @@ public class ComicModule extends XposedModule {
                             if (AUTO_CHECKIN) {
                                 decor.postDelayed(() -> startAutoCheckin(act), 1500);
                             }
-                            if (DEBUG_CLIPBOARD) {
-                                long[] cps = {12000, 26000, 45000, 70000, 100000};
-                                for (long c : cps) {
-                                    decor.postDelayed(() -> copyRecord(act), c);
-                                }
-                            }
                         }
                     }
                 } catch (Throwable ignored) {
                 }
                 return result;
             });
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook onResume 失败", t);
+        } catch (Throwable ignored) {
         }
     }
 
